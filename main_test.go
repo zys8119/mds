@@ -1,6 +1,7 @@
 package main
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -35,6 +36,19 @@ func TestExtractTitlesSkipsCodeBlock(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("第 %d 个标题不符: got=%q, want=%q", i, got[i], want[i])
 		}
+	}
+}
+
+func TestHighlightMatches(t *testing.T) {
+	re := regexp.MustCompile("foo")
+	got := highlightMatches("a foo b foo", re)
+	want := "a \x1b[1;31mfoo\x1b[0m b \x1b[1;31mfoo\x1b[0m"
+	if got != want {
+		t.Errorf("高亮结果不符:\n got=%q\nwant=%q", got, want)
+	}
+
+	if got := highlightMatches("no match", re); got != "no match" {
+		t.Errorf("无命中时应原样返回，实际 %q", got)
 	}
 }
 

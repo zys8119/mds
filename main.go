@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -71,12 +73,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 交互循环：在标题列表中按 ESC 会回到资源选择，可继续操作
+	// 交互循环：在标题列表中按 ESC 会回到资源选择，Ctrl+C 直接退出
 	for {
-		selectedAlias, err := selectAlias(config.URLs)
+		selectedAlias, key, err := selectAlias(config.URLs)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "错误：%v\n", err)
 			os.Exit(1)
+		}
+
+		if key == keyInterrupt {
+			exitInterrupt()
 		}
 
 		if selectedAlias == "" {
@@ -84,13 +90,57 @@ func main() {
 			return
 		}
 
-		searchResource(config, selectedAlias)
+		if searchResource(config, selectedAlias) {
+			exitInterrupt()
+		}
 	}
 }
 
+// exitInterrupt 处理 Ctrl+C：直接退出程序，不返回上一级
+func exitInterrupt() {
+	fmt.Println("已退出")
+	os.Exit(0)
+}
+
+// fzf 快捷键标记
+const (
+	keyInterrupt = "ctrl-c" // Ctrl+C：直接退出程序
+	keyBack      = "esc"    // ESC：返回上一级
+	keyRegex     = "ctrl-r" // Ctrl+R：进入正则检索
+)
+
+// parseFzfOutput 解析带 --expect esc,ctrl-c 的 fzf 输出
+// 第一行为触发的按键（未触发则为空），第二行为选中项
+func parseFzfOutput(output string) (selected string, key string) {
+	lines := strings.SplitN(strings.TrimRight(output, "\n"), "\n", 2)
+	if len(lines) > 0 {
+		key = strings.TrimSpace(lines[0])
+	}
+	if len(lines) > 1 {
+		selected = strings.TrimSpace(lines[1])
+	}
+	return selected, key
+}
+
+// fzfExitKey 把 fzf 异常退出码映射为快捷键语义
+// 130 表示被中断（Ctrl+C），其余（如 1 无匹配）按 ESC 处理
+func fzfExitKey(err error) (string, bool) {
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		return "", false
+	}
+	switch exitErr.ExitCode() {
+	case 130:
+		return keyInterrupt, true
+	case 1:
+		return keyBack, true
+	}
+	return "", false
+}
+
 // searchResource 搜索指定资源下的标题并复制内容
-// 在标题列表按 ESC 返回资源选择；复制完成后仍停留在标题列表，可继续操作
-func searchResource(config Config, selectedAlias string) {
+// 在标题列表按 ESC 返回资源选择（返回 false），按 Ctrl+C 请求退出程序（返回 true）
+func searchResource(config Config, selectedAlias string) bool {
 	var selectedURL string
 	for _, u := range config.URLs {
 		if u.Alias == selectedAlias {
@@ -101,7 +151,7 @@ func searchResource(config Config, selectedAlias string) {
 
 	if selectedURL == "" {
 		fmt.Printf("错误：未找到别名 '%s' 对应的 URL\n", selectedAlias)
-		return
+		return false
 	}
 
 	fmt.Printf("正在搜索资源: %s\n", selectedAlias)
@@ -110,32 +160,32 @@ func searchResource(config Config, selectedAlias string) {
 	content, err := fetchContent(selectedURL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "错误：无法获取 %s: %v\n", selectedURL, err)
-		return
+		return false
 	}
 
 	if content == "" {
 		fmt.Fprintln(os.Stderr, "错误：获取的内容为空")
-		return
+		return false
 	}
 
 	// 提取所有标题
 	titles := extractTitles(content)
 	if len(titles) == 0 {
 		fmt.Fprintln(os.Stderr, "错误：未找到任何 Markdown 标题")
-		return
+		return false
 	}
 
 	// 创建临时文件存储完整内容
 	tmpFile, err := os.CreateTemp("", "readme_*.md")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "错误：创建临时文件失败: %v\n", err)
-		return
+		return false
 	}
 	defer os.Remove(tmpFile.Name())
 
 	if _, err := tmpFile.WriteString(content); err != nil {
 		fmt.Fprintf(os.Stderr, "错误：写入临时文件失败: %v\n", err)
-		return
+		return false
 	}
 	tmpFile.Close()
 
@@ -144,47 +194,78 @@ func searchResource(config Config, selectedAlias string) {
 	defer os.Remove(previewScript)
 
 	for {
-		// 使用 fzf 选择标题
-		selectedTitle, err := runFzf(titles, previewScript)
+		// 使用 fzf 选择标题；Ctrl-R 进入正则检索
+		selectedTitle, key, err := runFzf(titles, previewScript)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "错误：%v\n", err)
-			return
+			return false
 		}
 
-		if selectedTitle == "" {
+		if key == keyInterrupt {
+			return true
+		}
+
+		if key == keyRegex {
+			hitTitle, exit, err := regexSearchPanel(content, titles)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "错误：正则检索失败: %v\n", err)
+				continue
+			}
+			if exit {
+				return true
+			}
+			if hitTitle != "" {
+				if copyTitleFlow(content, hitTitle) {
+					return true
+				}
+			}
+			continue
+		}
+
+		if key == keyBack || selectedTitle == "" {
 			// ESC：返回上一级（资源选择）
-			return
+			return false
 		}
 
-		// 提取并显示选中标题的内容
-		level := getTitleLevel(selectedTitle)
-		contentUnderTitle := extractContentUnderTitle(content, selectedTitle, level)
-
-		fmt.Printf("\n=== %s ===\n\n", selectedTitle)
-		fmt.Println(contentUnderTitle)
-
-		// 选择复制整体内容还是其中某一个代码块
-		copyText, copyLabel, err := selectCopyContent(contentUnderTitle)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "警告：选择复制内容失败: %v\n", err)
-			continue
+		if copyTitleFlow(content, selectedTitle) {
+			return true
 		}
-
-		if copyText == "" {
-			// ESC：返回上一级（标题列表）
-			fmt.Println("未选择复制内容，返回标题列表")
-			continue
-		}
-
-		// 复制到剪贴板 (macOS)
-		if err := copyToClipboard(copyText); err != nil {
-			fmt.Fprintf(os.Stderr, "警告：复制到剪贴板失败: %v\n", err)
-		} else {
-			fmt.Printf("\n✅ 已复制到剪贴板：%s\n", copyLabel)
-		}
-
-		fmt.Println("继续选择要复制的标题，按 ESC 返回资源选择")
 	}
+}
+
+// copyTitleFlow 展示标题下的内容，并让用户选择复制整体内容或其中某一个代码块
+// 返回 true 表示用户按了 Ctrl+C，需要直接退出程序
+func copyTitleFlow(content, selectedTitle string) bool {
+	level := getTitleLevel(selectedTitle)
+	contentUnderTitle := extractContentUnderTitle(content, selectedTitle, level)
+
+	fmt.Printf("\n=== %s ===\n\n", selectedTitle)
+	fmt.Println(contentUnderTitle)
+
+	copyText, copyLabel, key, err := selectCopyContent(contentUnderTitle)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "警告：选择复制内容失败: %v\n", err)
+		return false
+	}
+
+	if key == keyInterrupt {
+		return true
+	}
+
+	if copyText == "" {
+		// ESC：返回上一级（标题列表）
+		fmt.Println("未选择复制内容，返回标题列表")
+		return false
+	}
+
+	if err := copyToClipboard(copyText); err != nil {
+		fmt.Fprintf(os.Stderr, "警告：复制到剪贴板失败: %v\n", err)
+	} else {
+		fmt.Printf("\n✅ 已复制到剪贴板：%s\n", copyLabel)
+	}
+
+	fmt.Println("继续选择要复制的标题，按 ESC 返回资源选择")
+	return false
 }
 
 func printHelp() {
@@ -262,9 +343,11 @@ func printHelp() {
 	fmt.Println("  按 Enter 查看选中标题的完整内容")
 	fmt.Println("  之后选择复制「整体内容」或其中某一个代码块")
 	fmt.Println("  （标题内容中没有代码块时，直接复制整体内容）")
+	fmt.Println("  Ctrl-R: 输入正则表达式检索全文，按标题分组列出命中行")
+	fmt.Println("          预览保留全文并高亮命中，选中后回到该标题继续复制")
 	fmt.Println("  复制完成后可继续选择其他标题复制")
 	fmt.Println("  ESC 逐级返回：复制选择 -> 标题列表 -> 资源选择")
-	fmt.Println("  在资源选择处按 ESC / Ctrl+C 退出")
+	fmt.Println("  Ctrl+C 任意界面直接退出程序（不返回上一级）")
 	fmt.Println()
 	fmt.Println("配置文件:")
 	fmt.Println("  位置: ~/.mdsearch_config.json")
@@ -504,11 +587,11 @@ func saveConfig(config Config) error {
 	return os.WriteFile(configPath, data, 0644)
 }
 
-// selectAlias 让用户选择别名
-func selectAlias(urls []URLConfig) (string, error) {
+// selectAlias 让用户选择别名，返回选中的别名和触发的快捷键
+func selectAlias(urls []URLConfig) (string, string, error) {
 	if len(urls) == 1 {
 		// 只有一个资源，直接返回
-		return urls[0].Alias, nil
+		return urls[0].Alias, "", nil
 	}
 
 	// 构建选项列表：别名 + 标记当前选中
@@ -522,30 +605,37 @@ func selectAlias(urls []URLConfig) (string, error) {
 	}
 
 	// 使用 fzf 选择
-	cmd := exec.Command("fzf", "--prompt", "选择资源 > ", "--height", "40%")
+	cmd := exec.Command("fzf",
+		"--prompt", "选择资源 > ",
+		"--height", "40%",
+		"--header", "ESC: 退出  |  Ctrl+C: 直接退出",
+		"--expect", "esc,ctrl-c",
+	)
 	cmd.Stdin = strings.NewReader(strings.Join(options, "\n"))
 	cmd.Stderr = os.Stderr
 
 	output, err := cmd.Output()
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			if exitErr.ExitCode() == 130 || exitErr.ExitCode() == 1 {
-				return "", nil
-			}
+		if key, ok := fzfExitKey(err); ok {
+			return "", key, nil
 		}
-		return "", err
+		return "", "", err
 	}
 
-	selected := strings.TrimSpace(string(output))
+	selected, key := parseFzfOutput(string(output))
+	if key != "" || selected == "" {
+		return "", key, nil
+	}
+
 	// 从选中行提取别名（取箭头前面的部分）
 	parts := strings.Split(selected, " -> ")
 	if len(parts) == 2 {
 		aliasPart := strings.TrimSpace(parts[0])
 		// 移除可能的 * 标记
 		aliasPart = strings.TrimPrefix(aliasPart, "* ")
-		return aliasPart, nil
+		return aliasPart, "", nil
 	}
-	return selected, nil
+	return selected, "", nil
 }
 
 func fetchContent(url string) (string, error) {
@@ -698,19 +788,19 @@ func extractCodeBlocks(content string) []codeBlock {
 }
 
 // selectCopyContent 让用户选择复制整体内容还是其中某一个代码块
-// 返回要复制的文本和描述；用户取消时返回空文本
-func selectCopyContent(content string) (string, string, error) {
+// 返回要复制的文本、描述和触发的快捷键；用户按 ESC 取消时返回空文本
+func selectCopyContent(content string) (string, string, string, error) {
 	blocks := extractCodeBlocks(content)
 
 	const wholeLabel = "整体内容"
 	if len(blocks) == 0 {
-		return content, wholeLabel, nil
+		return content, wholeLabel, "", nil
 	}
 
 	// 把整体内容和每个代码块分别写入临时文件，供 fzf 预览使用
 	tmpDir, err := os.MkdirTemp("", "mds_copy_*")
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	defer os.RemoveAll(tmpDir)
 
@@ -719,13 +809,13 @@ func selectCopyContent(content string) (string, string, error) {
 	}
 
 	if err := writePreview(0, content); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	options := []string{wholeLabel}
 	for i, b := range blocks {
 		if err := writePreview(i+1, b.Body); err != nil {
-			return "", "", err
+			return "", "", "", err
 		}
 		lang := b.Lang
 		if lang == "" {
@@ -743,36 +833,39 @@ func selectCopyContent(content string) (string, string, error) {
 
 	cmd := exec.Command("fzf",
 		"--prompt", "复制内容 > ",
+		"--header", "ESC: 返回标题列表  |  Ctrl+C: 退出",
 		"--preview-window", "right:60%:wrap",
 		"--preview", previewScript+" {}",
+		"--expect", "esc,ctrl-c",
 		"--bind", "enter:accept",
-		"--bind", "ctrl-c:abort",
 	)
 	cmd.Stdin = strings.NewReader(strings.Join(options, "\n"))
 	cmd.Stderr = os.Stderr
 
 	output, err := cmd.Output()
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			if exitErr.ExitCode() == 130 || exitErr.ExitCode() == 1 {
-				return "", "", nil
-			}
+		if key, ok := fzfExitKey(err); ok {
+			return "", "", key, nil
 		}
-		return "", "", err
+		return "", "", "", err
 	}
 
-	selected := strings.TrimSpace(string(output))
+	selected, key := parseFzfOutput(string(output))
+	if key != "" {
+		return "", "", key, nil
+	}
+
 	if selected == "" || selected == wholeLabel {
-		return content, wholeLabel, nil
+		return content, wholeLabel, "", nil
 	}
 
 	for i, b := range blocks {
 		if strings.HasPrefix(selected, fmt.Sprintf("代码块 %d ", i+1)) {
-			return b.Body, selected, nil
+			return b.Body, selected, "", nil
 		}
 	}
 
-	return content, wholeLabel, nil
+	return content, wholeLabel, "", nil
 }
 
 // createCopyPreviewScript 生成用于预览"复制内容"候选项的脚本
@@ -872,32 +965,35 @@ BEGIN { found=0; in_code=0 }
 	return tmpFile.Name()
 }
 
-func runFzf(titles []string, previewScript string) (string, error) {
+// runFzf 选择标题，返回选中的标题和触发的快捷键
+// 快捷键 ctrl-r 表示请求进入正则检索
+func runFzf(titles []string, previewScript string) (string, string, error) {
 	titlesInput := strings.Join(titles, "\n")
 
 	tmpTitles, err := os.CreateTemp("", "titles_*.txt")
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer os.Remove(tmpTitles.Name())
 	if _, err := tmpTitles.WriteString(titlesInput); err != nil {
-		return "", err
+		return "", "", err
 	}
 	tmpTitles.Close()
 
 	// 构建 fzf 命令
 	cmd := exec.Command("fzf",
 		"--prompt", "选择标题 > ",
+		"--header", "Ctrl-R: 正则检索全文  |  ESC: 返回资源选择  |  Ctrl+C: 退出",
 		"--preview-window", "right:60%:wrap",
 		"--preview", previewScript+" {}",
+		"--expect", "ctrl-r,esc,ctrl-c",
 		"--bind", "enter:accept",
-		"--bind", "ctrl-c:abort",
 	)
 
 	// 从临时文件读取标题列表作为 stdin
 	f, err := os.Open(tmpTitles.Name())
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer f.Close()
 
@@ -907,13 +1003,170 @@ func runFzf(titles []string, previewScript string) (string, error) {
 	// 捕获 stdout
 	output, err := cmd.Output()
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			if exitErr.ExitCode() == 130 || exitErr.ExitCode() == 1 {
-				return "", nil
-			}
+		if key, ok := fzfExitKey(err); ok {
+			return "", key, nil
 		}
-		return "", err
+		return "", "", err
 	}
 
-	return strings.TrimSpace(string(output)), nil
+	selected, key := parseFzfOutput(string(output))
+	return selected, key, nil
+}
+
+// highlightMatches 用 ANSI 颜色高亮一行中所有正则匹配
+func highlightMatches(line string, re *regexp.Regexp) string {
+	locs := re.FindAllStringIndex(line, -1)
+	if len(locs) == 0 {
+		return line
+	}
+
+	var b strings.Builder
+	last := 0
+	for _, loc := range locs {
+		b.WriteString(line[last:loc[0]])
+		b.WriteString("\x1b[1;31m")
+		b.WriteString(line[loc[0]:loc[1]])
+		b.WriteString("\x1b[0m")
+		last = loc[1]
+	}
+	b.WriteString(line[last:])
+	return b.String()
+}
+
+// regexSearchPanel 正则检索全文：结果按标题分组列出命中行，预览保留全文并高亮命中
+// 返回选中命中项所属的标题；用户取消时返回空字符串
+func regexSearchPanel(content string, titles []string) (string, bool, error) {
+	fmt.Print("正则表达式 > ")
+	reader := bufio.NewReader(os.Stdin)
+	input, err := reader.ReadString('\n')
+	if err != nil && input == "" {
+		return "", false, nil
+	}
+	pattern := strings.TrimSpace(input)
+	if pattern == "" {
+		fmt.Println("未输入正则表达式")
+		return "", false, nil
+	}
+
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return "", false, fmt.Errorf("正则表达式无效: %v", err)
+	}
+
+	// 按标题划分，收集命中行，并把高亮后的全文写入临时文件供预览
+	tmpDir, err := os.MkdirTemp("", "mds_regex_*")
+	if err != nil {
+		return "", false, err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	type hit struct {
+		title string
+		line  int
+		text  string
+		seq   int // 预览文件序号
+	}
+	var hits []hit
+	seq := 0
+
+	for _, title := range titles {
+		level := getTitleLevel(title)
+		section := extractContentUnderTitle(content, title, level)
+		if section == "" {
+			continue
+		}
+
+		lines := strings.Split(section, "\n")
+		titleHits := 0
+		for _, line := range lines {
+			if re.MatchString(line) {
+				titleHits++
+			}
+		}
+		if titleHits == 0 {
+			continue
+		}
+
+		// 预览内容：全文保留，命中行高亮
+		var b strings.Builder
+		b.WriteString(fmt.Sprintf("%s  (命中 %d 处)\n", title, titleHits))
+		b.WriteString(strings.Repeat("─", 40) + "\n")
+		for _, line := range lines {
+			b.WriteString(highlightMatches(line, re))
+			b.WriteString("\n")
+		}
+		preview := b.String()
+
+		for i, line := range lines {
+			if !re.MatchString(line) {
+				continue
+			}
+			seq++
+			if err := os.WriteFile(filepath.Join(tmpDir, fmt.Sprintf("%d.txt", seq)), []byte(preview), 0644); err != nil {
+				return "", false, err
+			}
+			hits = append(hits, hit{title: title, line: i + 1, text: strings.TrimSpace(line), seq: seq})
+		}
+	}
+
+	if len(hits) == 0 {
+		fmt.Printf("没有匹配 '%s' 的内容\n", pattern)
+		return "", false, nil
+	}
+
+	// 选项格式：<预览文件序号>\t<标题>:<行号>: <命中行>
+	var options []string
+	for _, h := range hits {
+		options = append(options, fmt.Sprintf("%d\t%s:%d: %s", h.seq, h.title, h.line, h.text))
+	}
+
+	// 预览脚本：直接输出对应的高亮全文
+	script := fmt.Sprintf(`#!/bin/bash
+idx="$1"
+cat "%s/$idx.txt" 2>/dev/null
+`, tmpDir)
+	scriptFile, err := os.CreateTemp("", "regex_preview_*.sh")
+	if err != nil {
+		return "", false, err
+	}
+	defer os.Remove(scriptFile.Name())
+	scriptFile.WriteString(script)
+	scriptFile.Close()
+	os.Chmod(scriptFile.Name(), 0755)
+
+	cmd := exec.Command("fzf",
+		"--ansi",
+		"--delimiter", "\t",
+		"--with-nth", "2..",
+		"--prompt", fmt.Sprintf("正则命中 (%d) > ", len(hits)),
+		"--header", fmt.Sprintf("/%s/  |  ESC: 返回标题列表  |  Ctrl+C: 退出", pattern),
+		"--preview-window", "right:60%:wrap",
+		"--preview", scriptFile.Name()+" {1}",
+		"--expect", "esc,ctrl-c",
+		"--bind", "enter:accept",
+	)
+	cmd.Stdin = strings.NewReader(strings.Join(options, "\n"))
+	cmd.Stderr = os.Stderr
+
+	output, err := cmd.Output()
+	if err != nil {
+		if key, ok := fzfExitKey(err); ok {
+			return "", key == keyInterrupt, nil
+		}
+		return "", false, err
+	}
+
+	selected, key := parseFzfOutput(string(output))
+	if key != "" {
+		return "", key == keyInterrupt, nil
+	}
+	if selected == "" {
+		return "", false, nil
+	}
+	fields := strings.SplitN(selected, "\t", 2)
+	idx, err := strconv.Atoi(strings.TrimSpace(fields[0]))
+	if err != nil || idx < 1 || idx > len(hits) {
+		return "", false, nil
+	}
+	return hits[idx-1].title, false, nil
 }
