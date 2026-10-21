@@ -157,11 +157,23 @@ func main() {
 	fmt.Printf("\n=== %s ===\n\n", selectedTitle)
 	fmt.Println(contentUnderTitle)
 
+	// 选择复制整体内容还是其中某一个代码块
+	copyText, copyLabel, err := selectCopyContent(contentUnderTitle)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "警告：选择复制内容失败: %v\n", err)
+		return
+	}
+
+	if copyText == "" {
+		fmt.Println("未选择复制内容")
+		return
+	}
+
 	// 复制到剪贴板 (macOS)
-	if err := copyToClipboard(contentUnderTitle); err != nil {
+	if err := copyToClipboard(copyText); err != nil {
 		fmt.Fprintf(os.Stderr, "警告：复制到剪贴板失败: %v\n", err)
 	} else {
-		fmt.Println("\n✅ 内容已复制到剪贴板")
+		fmt.Printf("\n✅ 已复制到剪贴板：%s\n", copyLabel)
 	}
 }
 
@@ -238,6 +250,8 @@ func printHelp() {
 	fmt.Println("  选择资源时:  上下键切换，Enter 确认")
 	fmt.Println("  搜索标题时:  输入关键词模糊搜索，右侧实时预览内容")
 	fmt.Println("  按 Enter 查看选中标题的完整内容")
+	fmt.Println("  之后选择复制「整体内容」或其中某一个代码块")
+	fmt.Println("  （标题内容中没有代码块时，直接复制整体内容）")
 	fmt.Println("  按 Ctrl+C 或 ESC 退出")
 	fmt.Println()
 	fmt.Println("配置文件:")
@@ -621,6 +635,105 @@ func extractContentUnderTitle(content, title string, level int) string {
 	}
 
 	return strings.Join(result, "\n")
+}
+
+// codeBlock 表示一个围栏代码块
+type codeBlock struct {
+	StartLine int    // 围栏起始行（0 基）
+	EndLine   int    // 围栏结束行（0 基），未闭合时为最后一行
+	Lang      string // 围栏后声明的语言，可能为空
+	Body      string // 围栏内部的代码内容（不含围栏行）
+}
+
+// extractCodeBlocks 提取内容中的所有围栏代码块
+func extractCodeBlocks(content string) []codeBlock {
+	lines := strings.Split(content, "\n")
+	var blocks []codeBlock
+	start := -1
+	lang := ""
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !isFence(line) {
+			continue
+		}
+		if start < 0 {
+			start = i
+			lang = strings.TrimSpace(strings.TrimLeft(trimmed, "`~"))
+			continue
+		}
+		blocks = append(blocks, codeBlock{
+			StartLine: start,
+			EndLine:   i,
+			Lang:      lang,
+			Body:      strings.Join(lines[start+1:i], "\n"),
+		})
+		start = -1
+		lang = ""
+	}
+
+	// 未闭合的代码块，取到结尾
+	if start >= 0 {
+		blocks = append(blocks, codeBlock{
+			StartLine: start,
+			EndLine:   len(lines) - 1,
+			Lang:      lang,
+			Body:      strings.Join(lines[start+1:], "\n"),
+		})
+	}
+
+	return blocks
+}
+
+// selectCopyContent 让用户选择复制整体内容还是其中某一个代码块
+// 返回要复制的文本和描述；用户取消时返回空文本
+func selectCopyContent(content string) (string, string, error) {
+	blocks := extractCodeBlocks(content)
+
+	const wholeLabel = "整体内容"
+	if len(blocks) == 0 {
+		return content, wholeLabel, nil
+	}
+
+	options := []string{wholeLabel}
+	for i, b := range blocks {
+		lang := b.Lang
+		if lang == "" {
+			lang = "无语言"
+		}
+		lineCount := 0
+		if b.Body != "" {
+			lineCount = len(strings.Split(b.Body, "\n"))
+		}
+		options = append(options, fmt.Sprintf("代码块 %d (%s, %d 行)", i+1, lang, lineCount))
+	}
+
+	cmd := exec.Command("fzf", "--prompt", "复制内容 > ", "--height", "40%")
+	cmd.Stdin = strings.NewReader(strings.Join(options, "\n"))
+	cmd.Stderr = os.Stderr
+
+	output, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if exitErr.ExitCode() == 130 || exitErr.ExitCode() == 1 {
+				return "", "", nil
+			}
+		}
+		return "", "", err
+	}
+
+	selected := strings.TrimSpace(string(output))
+	if selected == "" || selected == wholeLabel {
+		return content, wholeLabel, nil
+	}
+
+	for i, b := range blocks {
+		if strings.HasPrefix(selected, fmt.Sprintf("代码块 %d ", i+1)) {
+			return b.Body, selected, nil
+		}
+	}
+
+	return content, wholeLabel, nil
 }
 
 func copyToClipboard(text string) error {
