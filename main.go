@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,6 +28,13 @@ type Config struct {
 }
 
 func main() {
+	// 内部子命令：为 fzf 的 change:reload 提供正则过滤结果
+	// 用法: mdsearch --regex-filter <正则> <内容文件> <预览目录>
+	if len(os.Args) > 1 && os.Args[1] == "--regex-filter" {
+		handleRegexFilter()
+		return
+	}
+
 	// 解析命令行参数
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -343,8 +349,9 @@ func printHelp() {
 	fmt.Println("  按 Enter 查看选中标题的完整内容")
 	fmt.Println("  之后选择复制「整体内容」或其中某一个代码块")
 	fmt.Println("  （标题内容中没有代码块时，直接复制整体内容）")
-	fmt.Println("  Ctrl-R: 输入正则表达式检索全文，按标题分组列出命中行")
-	fmt.Println("          预览保留全文并高亮命中，选中后回到该标题继续复制")
+	fmt.Println("  Ctrl-R: 直接进入 fzf 正则检索，输入框内输入正则即实时过滤")
+	fmt.Println("          结果按标题分组列出命中行，预览保留全文并高亮命中")
+	fmt.Println("          选中后回到该标题继续复制")
 	fmt.Println("  复制完成后可继续选择其他标题复制")
 	fmt.Println("  ESC 逐级返回：复制选择 -> 标题列表 -> 资源选择")
 	fmt.Println("  Ctrl+C 任意界面直接退出程序（不返回上一级）")
@@ -1033,43 +1040,35 @@ func highlightMatches(line string, re *regexp.Regexp) string {
 	return b.String()
 }
 
-// regexSearchPanel 正则检索全文：结果按标题分组列出命中行，预览保留全文并高亮命中
-// 返回选中命中项所属的标题；用户取消时返回空字符串
-func regexSearchPanel(content string, titles []string) (string, bool, error) {
-	fmt.Print("正则表达式 > ")
-	reader := bufio.NewReader(os.Stdin)
-	input, err := reader.ReadString('\n')
-	if err != nil && input == "" {
-		return "", false, nil
-	}
-	pattern := strings.TrimSpace(input)
-	if pattern == "" {
-		fmt.Println("未输入正则表达式")
-		return "", false, nil
-	}
+// regexHit 一次正则命中
+type regexHit struct {
+	seq      int    // 预览文件序号
+	titleIdx int    // 所属标题在 titles 中的下标
+	title    string // 所属标题
+	line     int    // 在标题内容内的行号
+	text     string // 命中行文本
+}
 
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return "", false, fmt.Errorf("正则表达式无效: %v", err)
+// renderRegexHits 渲染为 fzf 输入行：<预览序号>\t<标题下标>\t<标题>:<行号>: <命中行>
+func renderRegexHits(hits []regexHit) string {
+	var b strings.Builder
+	for i, h := range hits {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		fmt.Fprintf(&b, "%d\t%d\t%s:%d: %s", h.seq, h.titleIdx, h.title, h.line, h.text)
 	}
+	return b.String()
+}
 
-	// 按标题划分，收集命中行，并把高亮后的全文写入临时文件供预览
-	tmpDir, err := os.MkdirTemp("", "mds_regex_*")
-	if err != nil {
-		return "", false, err
-	}
-	defer os.RemoveAll(tmpDir)
-
-	type hit struct {
-		title string
-		line  int
-		text  string
-		seq   int // 预览文件序号
-	}
-	var hits []hit
+// computeRegexHits 按标题划分全文，收集命中行并生成预览文件
+// re 为 nil 时返回全部行（用于首次进入时的完整列表）
+func computeRegexHits(content string, re *regexp.Regexp, previewDir string) ([]regexHit, error) {
+	titles := extractTitles(content)
+	var hits []regexHit
 	seq := 0
 
-	for _, title := range titles {
+	for ti, title := range titles {
 		level := getTitleLevel(title)
 		section := extractContentUnderTitle(content, title, level)
 		if section == "" {
@@ -1077,75 +1076,155 @@ func regexSearchPanel(content string, titles []string) (string, bool, error) {
 		}
 
 		lines := strings.Split(section, "\n")
-		titleHits := 0
-		for _, line := range lines {
-			if re.MatchString(line) {
-				titleHits++
+		var matched []int
+		for i, line := range lines {
+			if re == nil || re.MatchString(line) {
+				matched = append(matched, i)
 			}
 		}
-		if titleHits == 0 {
+		if len(matched) == 0 {
 			continue
 		}
 
 		// 预览内容：全文保留，命中行高亮
 		var b strings.Builder
-		b.WriteString(fmt.Sprintf("%s  (命中 %d 处)\n", title, titleHits))
-		b.WriteString(strings.Repeat("─", 40) + "\n")
-		for _, line := range lines {
-			b.WriteString(highlightMatches(line, re))
-			b.WriteString("\n")
+		if re == nil {
+			b.WriteString(title + "\n")
+			b.WriteString(strings.Repeat("─", 40) + "\n")
+			b.WriteString(section + "\n")
+		} else {
+			b.WriteString(fmt.Sprintf("%s  (命中 %d 处)\n", title, len(matched)))
+			b.WriteString(strings.Repeat("─", 40) + "\n")
+			for _, line := range lines {
+				b.WriteString(highlightMatches(line, re))
+				b.WriteString("\n")
+			}
 		}
 		preview := b.String()
 
-		for i, line := range lines {
-			if !re.MatchString(line) {
-				continue
-			}
+		for _, i := range matched {
 			seq++
-			if err := os.WriteFile(filepath.Join(tmpDir, fmt.Sprintf("%d.txt", seq)), []byte(preview), 0644); err != nil {
-				return "", false, err
+			if err := os.WriteFile(filepath.Join(previewDir, fmt.Sprintf("%d.txt", seq)), []byte(preview), 0644); err != nil {
+				return nil, err
 			}
-			hits = append(hits, hit{title: title, line: i + 1, text: strings.TrimSpace(line), seq: seq})
+			hits = append(hits, regexHit{
+				seq:      seq,
+				titleIdx: ti,
+				title:    title,
+				line:     i + 1,
+				text:     strings.TrimSpace(lines[i]),
+			})
 		}
 	}
 
+	return hits, nil
+}
+
+// shellQuote 用单引号包裹参数，供 fzf reload 命令使用
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// handleRegexFilter 内部子命令：按正则输出命中列表，供 fzf 的 change:reload 调用
+// 用法: mdsearch --regex-filter <正则> <内容文件> <预览目录>
+func handleRegexFilter() {
+	if len(os.Args) < 5 {
+		return
+	}
+	pattern := os.Args[2]
+	contentFile := os.Args[3]
+	previewDir := os.Args[4]
+
+	data, err := os.ReadFile(contentFile)
+	if err != nil {
+		return
+	}
+
+	var re *regexp.Regexp
+	if strings.TrimSpace(pattern) != "" {
+		re, err = regexp.Compile(pattern)
+		if err != nil {
+			msg := strings.ReplaceAll(err.Error(), "\n", " ")
+			fmt.Printf("0\t0\t正则无效: %s", msg)
+			return
+		}
+	}
+
+	hits, err := computeRegexHits(string(data), re, previewDir)
+	if err != nil {
+		return
+	}
 	if len(hits) == 0 {
-		fmt.Printf("没有匹配 '%s' 的内容\n", pattern)
+		fmt.Print("0\t0\t没有匹配的内容")
+		return
+	}
+	fmt.Print(renderRegexHits(hits))
+}
+
+// regexSearchPanel 直接在 fzf 中输入正则实时检索全文
+// 输入框即正则表达式输入框，结果按标题分组列出命中行，预览保留全文并高亮命中
+// 返回选中命中项所属的标题；第二个返回值表示用户按了 Ctrl+C 需要直接退出程序
+func regexSearchPanel(content string, titles []string) (string, bool, error) {
+	self, err := os.Executable()
+	if err != nil {
+		return "", false, err
+	}
+
+	tmpDir, err := os.MkdirTemp("", "mds_regex_*")
+	if err != nil {
+		return "", false, err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	previewDir := filepath.Join(tmpDir, "preview")
+	if err := os.MkdirAll(previewDir, 0755); err != nil {
+		return "", false, err
+	}
+
+	contentFile := filepath.Join(tmpDir, "content.md")
+	if err := os.WriteFile(contentFile, []byte(content), 0644); err != nil {
+		return "", false, err
+	}
+
+	// 首次进入展示全部行，之后由 change:reload 调用自身按正则刷新
+	initial, err := computeRegexHits(content, nil, previewDir)
+	if err != nil {
+		return "", false, err
+	}
+	if len(initial) == 0 {
+		fmt.Println("文档中没有可检索的内容")
 		return "", false, nil
 	}
 
-	// 选项格式：<预览文件序号>\t<标题>:<行号>: <命中行>
-	var options []string
-	for _, h := range hits {
-		options = append(options, fmt.Sprintf("%d\t%s:%d: %s", h.seq, h.title, h.line, h.text))
-	}
-
-	// 预览脚本：直接输出对应的高亮全文
-	script := fmt.Sprintf(`#!/bin/bash
-idx="$1"
-cat "%s/$idx.txt" 2>/dev/null
-`, tmpDir)
+	previewScript := fmt.Sprintf(`#!/bin/bash
+cat "%s/$1.txt" 2>/dev/null
+`, previewDir)
 	scriptFile, err := os.CreateTemp("", "regex_preview_*.sh")
 	if err != nil {
 		return "", false, err
 	}
 	defer os.Remove(scriptFile.Name())
-	scriptFile.WriteString(script)
+	scriptFile.WriteString(previewScript)
 	scriptFile.Close()
 	os.Chmod(scriptFile.Name(), 0755)
 
+	reload := fmt.Sprintf("%s --regex-filter {q} %s %s",
+		shellQuote(self), shellQuote(contentFile), shellQuote(previewDir))
+
 	cmd := exec.Command("fzf",
 		"--ansi",
+		"--disabled",
 		"--delimiter", "\t",
-		"--with-nth", "2..",
-		"--prompt", fmt.Sprintf("正则命中 (%d) > ", len(hits)),
-		"--header", fmt.Sprintf("/%s/  |  ESC: 返回标题列表  |  Ctrl+C: 退出", pattern),
+		"--with-nth", "3..",
+		"--prompt", "正则 > ",
+		"--header", "直接输入正则表达式实时检索  |  ESC: 返回标题列表  |  Ctrl+C: 退出",
 		"--preview-window", "right:60%:wrap",
 		"--preview", scriptFile.Name()+" {1}",
+		"--bind", "change:reload:"+reload,
 		"--expect", "esc,ctrl-c",
 		"--bind", "enter:accept",
 	)
-	cmd.Stdin = strings.NewReader(strings.Join(options, "\n"))
+	cmd.Stdin = strings.NewReader(renderRegexHits(initial))
 	cmd.Stderr = os.Stderr
 
 	output, err := cmd.Output()
@@ -1163,10 +1242,14 @@ cat "%s/$idx.txt" 2>/dev/null
 	if selected == "" {
 		return "", false, nil
 	}
-	fields := strings.SplitN(selected, "\t", 2)
-	idx, err := strconv.Atoi(strings.TrimSpace(fields[0]))
-	if err != nil || idx < 1 || idx > len(hits) {
+
+	fields := strings.SplitN(selected, "\t", 3)
+	if len(fields) < 2 {
 		return "", false, nil
 	}
-	return hits[idx-1].title, false, nil
+	ti, err := strconv.Atoi(strings.TrimSpace(fields[1]))
+	if err != nil || ti < 0 || ti >= len(titles) {
+		return "", false, nil
+	}
+	return titles[ti], false, nil
 }
