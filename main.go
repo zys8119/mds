@@ -66,6 +66,12 @@ func main() {
 		case "--help", "-h":
 			printHelp()
 			return
+		case "--completion":
+			handleCompletion()
+			return
+		case "--list-aliases":
+			handleListAliases()
+			return
 		}
 	}
 
@@ -305,6 +311,9 @@ func printHelp() {
 	fmt.Println()
 	fmt.Println("  --help / -h                        显示此帮助信息")
 	fmt.Println()
+	fmt.Println("  --completion <bash|zsh>            输出对应 shell 的补全脚本")
+	fmt.Println("  --list-aliases                     仅列出所有别名（供补全脚本调用）")
+	fmt.Println()
 	fmt.Println("示例 (长参数):")
 	fmt.Println("  1. 添加资源:")
 	fmt.Println("     mdsearch --config add blog https://raw.githubusercontent.com/zys8119/Blog/refs/heads/master/README.md")
@@ -364,6 +373,105 @@ func printHelp() {
 	fmt.Println("  - fzf: 需要安装 fzf (brew install fzf)")
 	fmt.Println("  - awk, grep, bash: 系统自带")
 }
+
+// handleListAliases 输出所有已配置别名，每行一个，供 shell 补全使用
+func handleListAliases() {
+	config := loadConfig()
+	for _, u := range config.URLs {
+		fmt.Println(u.Alias)
+	}
+}
+
+// handleCompletion 输出 shell 补全脚本
+// 用法: mds --completion bash  /  mds --completion zsh
+func handleCompletion() {
+	shell := ""
+	if len(os.Args) > 2 {
+		shell = os.Args[2]
+	}
+	if shell == "" {
+		fmt.Fprintln(os.Stderr, "用法: mds --completion <bash|zsh>")
+		os.Exit(1)
+	}
+
+	switch shell {
+	case "bash":
+		fmt.Print(bashCompletionScript)
+	case "zsh":
+		fmt.Print(zshCompletionScript)
+	default:
+		fmt.Fprintf(os.Stderr, "不支持的 shell: %s（仅支持 bash / zsh）\n", shell)
+		os.Exit(1)
+	}
+}
+
+const bashCompletionScript = `# bash completion for mds
+_mds() {
+    local cur prev
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    local aliases
+
+    case "$prev" in
+        --config|-c)
+            COMPREPLY=( $(compgen -W "add modify list use remove" -- "$cur") )
+            return 0
+            ;;
+        add|-a|use|-u|remove|-r|modify|-m)
+            aliases=$(mds --list-aliases 2>/dev/null)
+            COMPREPLY=( $(compgen -W "$aliases" -- "$cur") )
+            return 0
+            ;;
+        --completion)
+            COMPREPLY=( $(compgen -W "bash zsh" -- "$cur") )
+            return 0
+            ;;
+    esac
+
+    if [ "$COMP_CWORD" -eq 1 ]; then
+        COMPREPLY=( $(compgen -W "--config --help -h --completion --list-aliases" -- "$cur") )
+    fi
+    return 0
+}
+complete -F _mds mds mdsearch
+`
+
+const zshCompletionScript = `#compdef mds mdsearch
+# zsh completion for mds
+_mds() {
+    local -a cmds subcmds aliases
+    cmds=(--config --help -h --completion --list-aliases)
+    subcmds=(add modify list use remove)
+
+    if (( CURRENT == 2 )); then
+        _describe 'command' cmds
+        return
+    fi
+
+    case "${words[2]}" in
+        --config|-c)
+            if (( CURRENT == 3 )); then
+                _describe 'subcommand' subcmds
+                return
+            fi
+            case "${words[3]}" in
+                add|-a|use|-u|remove|-r|modify|-m)
+                    aliases=(${(f)"$(mds --list-aliases 2>/dev/null)"})
+                    if (( ${#aliases} )); then
+                        _describe 'alias' aliases
+                    fi
+                    ;;
+            esac
+            ;;
+        --completion)
+            if (( CURRENT == 3 )); then
+                _values 'shell' bash zsh
+            fi
+            ;;
+    esac
+}
+_mds "$@"
+`
 
 func printConfigHelp() {
 	fmt.Println("配置管理命令:")

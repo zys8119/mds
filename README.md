@@ -118,6 +118,55 @@ mds --help                         # 查看完整帮助
 }
 ```
 
+## Shell 补全
+
+内置 bash / zsh 补全脚本，支持补全子命令、`--config` 的子操作、shell 名，以及**已配置的资源别名**。
+
+### bash
+
+```bash
+# 临时生效
+source <(mds --completion bash)
+
+# 永久生效
+mds --completion bash > /usr/local/etc/bash_completion.d/mds
+# 或
+echo 'source <(mds --completion bash)' >> ~/.bashrc
+```
+
+### zsh
+
+```bash
+# 写入 fpath 中的目录，文件名需以 _ 开头
+mds --completion zsh > "${fpath[1]}/_mds"
+
+# 或在 ~/.zshrc 中直接 source
+echo 'source <(mds --completion zsh)' >> ~/.zshrc
+```
+
+补全效果：
+
+```text
+$ mds <TAB>
+--config  --help  -h  --completion  --list-aliases
+
+$ mds --config <TAB>
+add  modify  list  use  remove
+
+$ mds --config add <TAB>
+blog  skills          # 来自配置文件中的别名
+
+$ mds --config use b<TAB>
+blog
+
+$ mds --completion <TAB>
+bash  zsh
+```
+
+`--list-aliases` 是补全脚本内部调用的辅助命令，按行输出所有别名；正常使用无需手动执行。
+
+补全脚本同时注册了 `mds` 和 `mdsearch` 两个命令名，二进制改成哪个名字都能用。
+
 ## 工作原理
 
 1. 按别名取出 URL，`GET` 下载 Markdown 原文。
