@@ -71,19 +71,26 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 让用户选择要搜索的别名
-	selectedAlias, err := selectAlias(config.URLs)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "错误：%v\n", err)
-		os.Exit(1)
-	}
+	// 交互循环：在标题列表中按 ESC 会回到资源选择，可继续操作
+	for {
+		selectedAlias, err := selectAlias(config.URLs)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "错误：%v\n", err)
+			os.Exit(1)
+		}
 
-	if selectedAlias == "" {
-		fmt.Println("未选择任何资源")
-		return
-	}
+		if selectedAlias == "" {
+			fmt.Println("未选择任何资源")
+			return
+		}
 
-	// 获取对应的 URL
+		searchResource(config, selectedAlias)
+	}
+}
+
+// searchResource 搜索指定资源下的标题并复制内容
+// 在标题列表按 ESC 返回资源选择；复制完成后仍停留在标题列表，可继续操作
+func searchResource(config Config, selectedAlias string) {
 	var selectedURL string
 	for _, u := range config.URLs {
 		if u.Alias == selectedAlias {
@@ -94,7 +101,7 @@ func main() {
 
 	if selectedURL == "" {
 		fmt.Printf("错误：未找到别名 '%s' 对应的 URL\n", selectedAlias)
-		os.Exit(1)
+		return
 	}
 
 	fmt.Printf("正在搜索资源: %s\n", selectedAlias)
@@ -103,32 +110,32 @@ func main() {
 	content, err := fetchContent(selectedURL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "错误：无法获取 %s: %v\n", selectedURL, err)
-		os.Exit(1)
+		return
 	}
 
 	if content == "" {
 		fmt.Fprintln(os.Stderr, "错误：获取的内容为空")
-		os.Exit(1)
+		return
 	}
 
 	// 提取所有标题
 	titles := extractTitles(content)
 	if len(titles) == 0 {
 		fmt.Fprintln(os.Stderr, "错误：未找到任何 Markdown 标题")
-		os.Exit(1)
+		return
 	}
 
 	// 创建临时文件存储完整内容
 	tmpFile, err := os.CreateTemp("", "readme_*.md")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "错误：创建临时文件失败: %v\n", err)
-		os.Exit(1)
+		return
 	}
 	defer os.Remove(tmpFile.Name())
 
 	if _, err := tmpFile.WriteString(content); err != nil {
 		fmt.Fprintf(os.Stderr, "错误：写入临时文件失败: %v\n", err)
-		os.Exit(1)
+		return
 	}
 	tmpFile.Close()
 
@@ -136,44 +143,47 @@ func main() {
 	previewScript := createPreviewScript(tmpFile.Name())
 	defer os.Remove(previewScript)
 
-	// 使用 fzf 选择标题
-	selectedTitle, err := runFzf(titles, previewScript)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "错误：%v\n", err)
-		os.Exit(1)
-	}
+	for {
+		// 使用 fzf 选择标题
+		selectedTitle, err := runFzf(titles, previewScript)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "错误：%v\n", err)
+			return
+		}
 
-	fmt.Fprintf(os.Stderr, "[DEBUG] 选中的标题: '%s'\n", selectedTitle)
+		if selectedTitle == "" {
+			// ESC：返回上一级（资源选择）
+			return
+		}
 
-	if selectedTitle == "" {
-		fmt.Println("未选择任何标题")
-		return
-	}
+		// 提取并显示选中标题的内容
+		level := getTitleLevel(selectedTitle)
+		contentUnderTitle := extractContentUnderTitle(content, selectedTitle, level)
 
-	// 提取并显示选中标题的内容
-	level := getTitleLevel(selectedTitle)
-	contentUnderTitle := extractContentUnderTitle(content, selectedTitle, level)
+		fmt.Printf("\n=== %s ===\n\n", selectedTitle)
+		fmt.Println(contentUnderTitle)
 
-	fmt.Printf("\n=== %s ===\n\n", selectedTitle)
-	fmt.Println(contentUnderTitle)
+		// 选择复制整体内容还是其中某一个代码块
+		copyText, copyLabel, err := selectCopyContent(contentUnderTitle)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "警告：选择复制内容失败: %v\n", err)
+			continue
+		}
 
-	// 选择复制整体内容还是其中某一个代码块
-	copyText, copyLabel, err := selectCopyContent(contentUnderTitle)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "警告：选择复制内容失败: %v\n", err)
-		return
-	}
+		if copyText == "" {
+			// ESC：返回上一级（标题列表）
+			fmt.Println("未选择复制内容，返回标题列表")
+			continue
+		}
 
-	if copyText == "" {
-		fmt.Println("未选择复制内容")
-		return
-	}
+		// 复制到剪贴板 (macOS)
+		if err := copyToClipboard(copyText); err != nil {
+			fmt.Fprintf(os.Stderr, "警告：复制到剪贴板失败: %v\n", err)
+		} else {
+			fmt.Printf("\n✅ 已复制到剪贴板：%s\n", copyLabel)
+		}
 
-	// 复制到剪贴板 (macOS)
-	if err := copyToClipboard(copyText); err != nil {
-		fmt.Fprintf(os.Stderr, "警告：复制到剪贴板失败: %v\n", err)
-	} else {
-		fmt.Printf("\n✅ 已复制到剪贴板：%s\n", copyLabel)
+		fmt.Println("继续选择要复制的标题，按 ESC 返回资源选择")
 	}
 }
 
@@ -252,7 +262,9 @@ func printHelp() {
 	fmt.Println("  按 Enter 查看选中标题的完整内容")
 	fmt.Println("  之后选择复制「整体内容」或其中某一个代码块")
 	fmt.Println("  （标题内容中没有代码块时，直接复制整体内容）")
-	fmt.Println("  按 Ctrl+C 或 ESC 退出")
+	fmt.Println("  复制完成后可继续选择其他标题复制")
+	fmt.Println("  ESC 逐级返回：复制选择 -> 标题列表 -> 资源选择")
+	fmt.Println("  在资源选择处按 ESC / Ctrl+C 退出")
 	fmt.Println()
 	fmt.Println("配置文件:")
 	fmt.Println("  位置: ~/.mdsearch_config.json")
