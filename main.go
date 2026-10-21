@@ -1,0 +1,707 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+)
+
+const configFileName = ".mdsearch_config.json"
+
+// URLConfig URL 配置
+type URLConfig struct {
+	Alias   string `json:"alias"`
+	URL     string `json:"url"`
+	Current bool   `json:"current"` // 当前选中的资源
+}
+
+// Config 配置结构
+type Config struct {
+	URLs []URLConfig `json:"urls"`
+}
+
+func main() {
+	// 解析命令行参数
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--config", "-c":
+			if len(os.Args) < 3 {
+				printConfigHelp()
+				return
+			}
+			switch os.Args[2] {
+			case "add", "-a":
+				handleConfigAdd()
+				return
+			case "list", "-l":
+				handleConfigList()
+				return
+			case "remove", "-r":
+				handleConfigRemove()
+				return
+			case "use", "-u":
+				handleConfigUse()
+				return
+			case "modify", "-m":
+				handleConfigModify()
+				return
+			default:
+				printConfigHelp()
+				return
+			}
+		case "--help", "-h":
+			printHelp()
+			return
+		}
+	}
+
+	// 正常启动：先选择别名，然后搜索对应资源
+	config := loadConfig()
+	if len(config.URLs) == 0 {
+		fmt.Println("错误：没有配置任何资源 URL")
+		fmt.Println("请使用以下命令添加：")
+		fmt.Println("  mdsearch --config add <别名> <URL>")
+		fmt.Println("  mdsearch --config list")
+		os.Exit(1)
+	}
+
+	// 让用户选择要搜索的别名
+	selectedAlias, err := selectAlias(config.URLs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "错误：%v\n", err)
+		os.Exit(1)
+	}
+
+	if selectedAlias == "" {
+		fmt.Println("未选择任何资源")
+		return
+	}
+
+	// 获取对应的 URL
+	var selectedURL string
+	for _, u := range config.URLs {
+		if u.Alias == selectedAlias {
+			selectedURL = u.URL
+			break
+		}
+	}
+
+	if selectedURL == "" {
+		fmt.Printf("错误：未找到别名 '%s' 对应的 URL\n", selectedAlias)
+		os.Exit(1)
+	}
+
+	fmt.Printf("正在搜索资源: %s\n", selectedAlias)
+
+	// 获取内容并搜索
+	content, err := fetchContent(selectedURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "错误：无法获取 %s: %v\n", selectedURL, err)
+		os.Exit(1)
+	}
+
+	if content == "" {
+		fmt.Fprintln(os.Stderr, "错误：获取的内容为空")
+		os.Exit(1)
+	}
+
+	// 提取所有标题
+	titles := extractTitles(content)
+	if len(titles) == 0 {
+		fmt.Fprintln(os.Stderr, "错误：未找到任何 Markdown 标题")
+		os.Exit(1)
+	}
+
+	// 创建临时文件存储完整内容
+	tmpFile, err := os.CreateTemp("", "readme_*.md")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "错误：创建临时文件失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString(content); err != nil {
+		fmt.Fprintf(os.Stderr, "错误：写入临时文件失败: %v\n", err)
+		os.Exit(1)
+	}
+	tmpFile.Close()
+
+	// 创建预览脚本
+	previewScript := createPreviewScript(tmpFile.Name())
+	defer os.Remove(previewScript)
+
+	// 使用 fzf 选择标题
+	selectedTitle, err := runFzf(titles, previewScript)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "错误：%v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Fprintf(os.Stderr, "[DEBUG] 选中的标题: '%s'\n", selectedTitle)
+
+	if selectedTitle == "" {
+		fmt.Println("未选择任何标题")
+		return
+	}
+
+	// 提取并显示选中标题的内容
+	level := getTitleLevel(selectedTitle)
+	contentUnderTitle := extractContentUnderTitle(content, selectedTitle, level)
+
+	fmt.Printf("\n=== %s ===\n\n", selectedTitle)
+	fmt.Println(contentUnderTitle)
+
+	// 复制到剪贴板 (macOS)
+	if err := copyToClipboard(contentUnderTitle); err != nil {
+		fmt.Fprintf(os.Stderr, "警告：复制到剪贴板失败: %v\n", err)
+	} else {
+		fmt.Println("\n✅ 内容已复制到剪贴板")
+	}
+}
+
+func printHelp() {
+	fmt.Println("╔══════════════════════════════════════════════════════════════╗")
+	fmt.Println("║  mdsearch - 使用 fzf 交互式搜索 Markdown 文档标题          ║")
+	fmt.Println("╚══════════════════════════════════════════════════════════════╝")
+	fmt.Println()
+	fmt.Println("描述:")
+	fmt.Println("  从远程 Markdown 文件（如 README.md）中提取所有标题，")
+	fmt.Println("  通过 fzf 进行模糊搜索和实时预览，快速定位并查看内容。")
+	fmt.Println()
+	fmt.Println("用法:")
+	fmt.Println("  mdsearch [命令] [参数...]")
+	fmt.Println()
+	fmt.Println("命令 (长参数 / 短参数):")
+	fmt.Println("  (无参数)                          启动交互式搜索")
+	fmt.Println("                                    先选择资源别名，再搜索标题")
+	fmt.Println()
+	fmt.Println("  --config add / -c -a <别名> <URL>   添加一个资源")
+	fmt.Println("                                    别名用于快速识别和切换")
+	fmt.Println()
+	fmt.Println("  --config modify / -c -m <别名> <新URL>  修改资源的 URL")
+	fmt.Println()
+	fmt.Println("  --config list / -c -l              列出所有已配置的资源")
+	fmt.Println("                                    带 * 标记的是当前选中的资源")
+	fmt.Println()
+	fmt.Println("  --config use / -c -u <别名>        切换到指定的资源")
+	fmt.Println("                                    后续搜索将使用该资源")
+	fmt.Println()
+	fmt.Println("  --config remove / -c -r <别名>     删除指定的资源")
+	fmt.Println()
+	fmt.Println("  --help / -h                        显示此帮助信息")
+	fmt.Println()
+	fmt.Println("示例 (长参数):")
+	fmt.Println("  1. 添加资源:")
+	fmt.Println("     mdsearch --config add blog https://raw.githubusercontent.com/zys8119/Blog/refs/heads/master/README.md")
+	fmt.Println()
+	fmt.Println("  2. 修改资源 URL:")
+	fmt.Println("     mdsearch --config modify blog https://new-url.com/README.md")
+	fmt.Println()
+	fmt.Println("  3. 列出资源:")
+	fmt.Println("     mdsearch --config list")
+	fmt.Println()
+	fmt.Println("  4. 切换资源:")
+	fmt.Println("     mdsearch --config use blog")
+	fmt.Println()
+	fmt.Println("  5. 删除资源:")
+	fmt.Println("     mdsearch --config remove docs")
+	fmt.Println()
+	fmt.Println("  6. 启动搜索:")
+	fmt.Println("     mdsearch")
+	fmt.Println()
+	fmt.Println("示例 (短参数):")
+	fmt.Println("  1. 添加资源:")
+	fmt.Println("     mdsearch -c -a blog https://raw.githubusercontent.com/zys8119/Blog/refs/heads/master/README.md")
+	fmt.Println()
+	fmt.Println("  2. 修改资源 URL:")
+	fmt.Println("     mdsearch -c -m blog https://new-url.com/README.md")
+	fmt.Println()
+	fmt.Println("  3. 列出资源:")
+	fmt.Println("     mdsearch -c -l")
+	fmt.Println()
+	fmt.Println("  4. 切换资源:")
+	fmt.Println("     mdsearch -c -u blog")
+	fmt.Println()
+	fmt.Println("  5. 删除资源:")
+	fmt.Println("     mdsearch -c -r docs")
+	fmt.Println()
+	fmt.Println("  6. 查看帮助:")
+	fmt.Println("     mdsearch -h")
+	fmt.Println()
+	fmt.Println("交互操作:")
+	fmt.Println("  选择资源时:  上下键切换，Enter 确认")
+	fmt.Println("  搜索标题时:  输入关键词模糊搜索，右侧实时预览内容")
+	fmt.Println("  按 Enter 查看选中标题的完整内容")
+	fmt.Println("  按 Ctrl+C 或 ESC 退出")
+	fmt.Println()
+	fmt.Println("配置文件:")
+	fmt.Println("  位置: ~/.mdsearch_config.json")
+	fmt.Println("  可手动编辑，但建议使用命令管理")
+	fmt.Println()
+	fmt.Println("环境要求:")
+	fmt.Println("  - fzf: 需要安装 fzf (brew install fzf)")
+	fmt.Println("  - awk, grep, bash: 系统自带")
+}
+
+func printConfigHelp() {
+	fmt.Println("配置管理命令:")
+	fmt.Println("  mdsearch --config add <别名> <URL>   添加资源")
+	fmt.Println("  mdsearch --config list               列出所有资源（显示当前选中）")
+	fmt.Println("  mdsearch --config remove <别名>      删除资源")
+	fmt.Println("  mdsearch --config use <别名>         切换当前选中的资源")
+	fmt.Println("  mdsearch --config modify <别名> <新URL>  修改资源的 URL")
+}
+
+// handleConfigAdd 处理添加配置
+func handleConfigAdd() {
+	if len(os.Args) < 5 {
+		fmt.Println("错误：请提供别名和 URL")
+		fmt.Println("用法: mdsearch --config add <别名> <URL>")
+		fmt.Println("示例: mdsearch --config add blog https://example.com/README.md")
+		os.Exit(1)
+	}
+
+	alias := os.Args[3]
+	url := os.Args[4]
+	config := loadConfig()
+
+	// 检查别名是否已存在
+	for i, u := range config.URLs {
+		if u.Alias == alias {
+			config.URLs[i].URL = url
+			// 如果当前没有选中任何资源，将更新的设为当前
+			if !hasCurrent(config.URLs) {
+				config.URLs[i].Current = true
+			}
+			if err := saveConfig(config); err != nil {
+				fmt.Fprintf(os.Stderr, "错误：保存配置失败: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("已更新别名 '%s' 的 URL: %s\n", alias, url)
+			return
+		}
+	}
+
+	// 新增资源，如果是第一个则设为当前
+	newURL := URLConfig{Alias: alias, URL: url, Current: false}
+	if len(config.URLs) == 0 {
+		newURL.Current = true
+	}
+	config.URLs = append(config.URLs, newURL)
+	if err := saveConfig(config); err != nil {
+		fmt.Fprintf(os.Stderr, "错误：保存配置失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("成功添加资源: %s -> %s\n", alias, url)
+	if len(config.URLs) == 1 {
+		fmt.Println("提示：该资源已设为当前选中")
+	}
+}
+
+// handleConfigList 列出所有配置
+func handleConfigList() {
+	config := loadConfig()
+	if len(config.URLs) == 0 {
+		fmt.Println("当前没有配置任何资源")
+		return
+	}
+
+	fmt.Println("已配置的资源:")
+	fmt.Println("---")
+	for i, u := range config.URLs {
+		marker := "  "
+		if u.Current {
+			marker = "* "
+		}
+		fmt.Printf("%s%d. %s -> %s\n", marker, i+1, u.Alias, u.URL)
+	}
+	fmt.Println("---")
+	fmt.Println("* 表示当前选中的资源")
+}
+
+// handleConfigRemove 删除配置
+func handleConfigRemove() {
+	if len(os.Args) < 4 {
+		fmt.Println("错误：请提供要删除的别名")
+		fmt.Println("用法: mdsearch --config remove <别名>")
+		os.Exit(1)
+	}
+
+	alias := os.Args[3]
+	config := loadConfig()
+
+	found := false
+	newURLs := []URLConfig{}
+	for _, u := range config.URLs {
+		if u.Alias == alias {
+			found = true
+			continue
+		}
+		newURLs = append(newURLs, u)
+	}
+
+	if !found {
+		fmt.Printf("未找到别名 '%s'\n", alias)
+		return
+	}
+
+	config.URLs = newURLs
+	// 如果删除的是当前选中的，重新设置一个当前选中
+	if len(config.URLs) > 0 && !hasCurrent(config.URLs) {
+		config.URLs[0].Current = true
+	}
+	if err := saveConfig(config); err != nil {
+		fmt.Fprintf(os.Stderr, "错误：保存配置失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("成功删除资源: %s\n", alias)
+}
+
+// handleConfigUse 切换当前选中的资源
+func handleConfigUse() {
+	if len(os.Args) < 4 {
+		fmt.Println("错误：请提供要切换的别名")
+		fmt.Println("用法: mdsearch --config use <别名>")
+		os.Exit(1)
+	}
+
+	alias := os.Args[3]
+	config := loadConfig()
+
+	found := false
+	for i := range config.URLs {
+		if config.URLs[i].Alias == alias {
+			config.URLs[i].Current = true
+			found = true
+		} else {
+			config.URLs[i].Current = false
+		}
+	}
+
+	if !found {
+		fmt.Printf("未找到别名 '%s'\n", alias)
+		os.Exit(1)
+	}
+
+	if err := saveConfig(config); err != nil {
+		fmt.Fprintf(os.Stderr, "错误：保存配置失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("已切换到资源: %s\n", alias)
+}
+
+// handleConfigModify 修改资源的 URL
+func handleConfigModify() {
+	if len(os.Args) < 5 {
+		fmt.Println("错误：请提供别名和新 URL")
+		fmt.Println("用法: mdsearch --config modify <别名> <新URL>")
+		fmt.Println("示例: mdsearch --config modify blog https://new-url.com/README.md")
+		os.Exit(1)
+	}
+
+	alias := os.Args[3]
+	newURL := os.Args[4]
+	config := loadConfig()
+
+	found := false
+	for i := range config.URLs {
+		if config.URLs[i].Alias == alias {
+			config.URLs[i].URL = newURL
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		fmt.Printf("未找到别名 '%s'\n", alias)
+		os.Exit(1)
+	}
+
+	if err := saveConfig(config); err != nil {
+		fmt.Fprintf(os.Stderr, "错误：保存配置失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("已更新资源 '%s' 的 URL: %s\n", alias, newURL)
+}
+
+// hasCurrent 检查是否有当前选中的资源
+func hasCurrent(urls []URLConfig) bool {
+	for _, u := range urls {
+		if u.Current {
+			return true
+		}
+	}
+	return false
+}
+
+// getConfigPath 获取配置文件路径
+func getConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return configFileName
+	}
+	return filepath.Join(home, configFileName)
+}
+
+// loadConfig 加载配置
+func loadConfig() Config {
+	configPath := getConfigPath()
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return Config{URLs: []URLConfig{}}
+	}
+
+	var config Config
+	if err := json.Unmarshal(data, &config); err != nil {
+		return Config{URLs: []URLConfig{}}
+	}
+	return config
+}
+
+// saveConfig 保存配置
+func saveConfig(config Config) error {
+	configPath := getConfigPath()
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(configPath, data, 0644)
+}
+
+// selectAlias 让用户选择别名
+func selectAlias(urls []URLConfig) (string, error) {
+	if len(urls) == 1 {
+		// 只有一个资源，直接返回
+		return urls[0].Alias, nil
+	}
+
+	// 构建选项列表：别名 + 标记当前选中
+	var options []string
+	for _, u := range urls {
+		marker := "  "
+		if u.Current {
+			marker = "* "
+		}
+		options = append(options, fmt.Sprintf("%s%s -> %s", marker, u.Alias, u.URL))
+	}
+
+	// 使用 fzf 选择
+	cmd := exec.Command("fzf", "--prompt", "选择资源 > ", "--height", "40%")
+	cmd.Stdin = strings.NewReader(strings.Join(options, "\n"))
+	cmd.Stderr = os.Stderr
+
+	output, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if exitErr.ExitCode() == 130 || exitErr.ExitCode() == 1 {
+				return "", nil
+			}
+		}
+		return "", err
+	}
+
+	selected := strings.TrimSpace(string(output))
+	// 从选中行提取别名（取箭头前面的部分）
+	parts := strings.Split(selected, " -> ")
+	if len(parts) == 2 {
+		aliasPart := strings.TrimSpace(parts[0])
+		// 移除可能的 * 标记
+		aliasPart = strings.TrimPrefix(aliasPart, "* ")
+		return aliasPart, nil
+	}
+	return selected, nil
+}
+
+func fetchContent(url string) (string, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return string(body), nil
+}
+
+func extractTitles(content string) []string {
+	lines := strings.Split(content, "\n")
+	var titles []string
+	titleRegex := regexp.MustCompile(`^#+\s+`)
+
+	for _, line := range lines {
+		if titleRegex.MatchString(line) {
+			titles = append(titles, line)
+		}
+	}
+	return titles
+}
+
+func getTitleLevel(title string) int {
+	count := 0
+	for _, ch := range title {
+		if ch == '#' {
+			count++
+		} else {
+			break
+		}
+	}
+	return count
+}
+
+func extractContentUnderTitle(content, title string, level int) string {
+	lines := strings.Split(content, "\n")
+	var result []string
+	found := false
+	titleRegex := regexp.MustCompile(`^#+`)
+
+	// 规范化标题用于比较
+	normalizeTitle := func(s string) string {
+		return strings.TrimSpace(s)
+	}
+
+	normalizedTarget := normalizeTitle(title)
+
+	for _, line := range lines {
+		if titleRegex.MatchString(line) {
+			currentLevel := getTitleLevel(line)
+			if found && currentLevel <= level {
+				break
+			}
+			// 使用规范化后的标题进行比较
+			if normalizeTitle(line) == normalizedTarget {
+				found = true
+				result = append(result, line)
+				continue
+			}
+		}
+		if found {
+			result = append(result, line)
+		}
+	}
+
+	return strings.Join(result, "\n")
+}
+
+func copyToClipboard(text string) error {
+	// macOS 使用 pbcopy
+	cmd := exec.Command("pbcopy")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	if _, err := stdin.Write([]byte(text)); err != nil {
+		return err
+	}
+	stdin.Close()
+
+	return cmd.Wait()
+}
+
+func createPreviewScript(contentFile string) string {
+	script := fmt.Sprintf(`#!/bin/bash
+title="$1"
+file="%s"
+
+if [ -z "$title" ] || [ -z "$file" ]; then
+    exit 1
+fi
+
+level=$(echo "$title" | awk '{print match($0, /^#+/); print RLENGTH}' | tail -1)
+
+awk -v t="$title" -v l="$level" '
+BEGIN { found=0 }
+{
+    if ($0 ~ /^#/) {
+        match($0, /^#+/);
+        current_level = RLENGTH;
+        if (found && current_level <= l) {
+            exit;
+        }
+        if ($0 == t) {
+            found=1;
+            print;
+            next;
+        }
+    }
+    if (found) {
+        print;
+    }
+}
+' "$file"
+`, contentFile)
+
+	tmpFile, _ := os.CreateTemp("", "preview_*.sh")
+	tmpFile.WriteString(script)
+	tmpFile.Close()
+	os.Chmod(tmpFile.Name(), 0755)
+	return tmpFile.Name()
+}
+
+func runFzf(titles []string, previewScript string) (string, error) {
+	titlesInput := strings.Join(titles, "\n")
+
+	tmpTitles, err := os.CreateTemp("", "titles_*.txt")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(tmpTitles.Name())
+	if _, err := tmpTitles.WriteString(titlesInput); err != nil {
+		return "", err
+	}
+	tmpTitles.Close()
+
+	// 构建 fzf 命令
+	cmd := exec.Command("fzf",
+		"--prompt", "选择标题 > ",
+		"--preview-window", "right:60%:wrap",
+		"--preview", previewScript+" {}",
+		"--bind", "enter:accept",
+		"--bind", "ctrl-c:abort",
+	)
+
+	// 从临时文件读取标题列表作为 stdin
+	f, err := os.Open(tmpTitles.Name())
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	cmd.Stdin = f
+	cmd.Stderr = os.Stderr
+
+	// 捕获 stdout
+	output, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if exitErr.ExitCode() == 130 || exitErr.ExitCode() == 1 {
+				return "", nil
+			}
+		}
+		return "", err
+	}
+
+	return strings.TrimSpace(string(output)), nil
+}
