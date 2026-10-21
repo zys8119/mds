@@ -541,12 +541,27 @@ func fetchContent(url string) (string, error) {
 	return string(body), nil
 }
 
+// isFence 判断是否为代码块围栏行（``` 或 ~~~）
+func isFence(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~")
+}
+
 func extractTitles(content string) []string {
 	lines := strings.Split(content, "\n")
 	var titles []string
 	titleRegex := regexp.MustCompile(`^#+\s+`)
+	inCodeBlock := false
 
 	for _, line := range lines {
+		if isFence(line) {
+			inCodeBlock = !inCodeBlock
+			continue
+		}
+		// 代码块内的 # 是注释，不作为标题
+		if inCodeBlock {
+			continue
+		}
 		if titleRegex.MatchString(line) {
 			titles = append(titles, line)
 		}
@@ -578,9 +593,17 @@ func extractContentUnderTitle(content, title string, level int) string {
 	}
 
 	normalizedTarget := normalizeTitle(title)
+	inCodeBlock := false
 
 	for _, line := range lines {
-		if titleRegex.MatchString(line) {
+		if isFence(line) {
+			inCodeBlock = !inCodeBlock
+			if found {
+				result = append(result, line)
+			}
+			continue
+		}
+		if !inCodeBlock && titleRegex.MatchString(line) {
 			currentLevel := getTitleLevel(line)
 			if found && currentLevel <= level {
 				break
@@ -631,10 +654,22 @@ fi
 
 level=$(echo "$title" | awk '{print match($0, /^#+/); print RLENGTH}' | tail -1)
 
-awk -v t="$title" -v l="$level" '
-BEGIN { found=0 }
+# 用八进制构造三个反引号，避免在 Go 原始字符串中直接出现反引号
+fence=$(printf '\140\140\140')
+
+awk -v t="$title" -v l="$level" -v fence="$fence" '
+BEGIN { found=0; in_code=0 }
 {
-    if ($0 ~ /^#/) {
+    # 代码块围栏（三个反引号或三个波浪号）开头，切换状态并原样输出
+    line=$0
+    sub(/^[[:space:]]+/, "", line)
+    if (substr(line, 1, 3) == fence || substr(line, 1, 3) == "~~~") {
+        in_code = !in_code;
+        if (found) print;
+        next;
+    }
+    # 仅在非代码块内识别标题
+    if (!in_code && $0 ~ /^#/) {
         match($0, /^#+/);
         current_level = RLENGTH;
         if (found && current_level <= l) {
