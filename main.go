@@ -695,8 +695,26 @@ func selectCopyContent(content string) (string, string, error) {
 		return content, wholeLabel, nil
 	}
 
+	// 把整体内容和每个代码块分别写入临时文件，供 fzf 预览使用
+	tmpDir, err := os.MkdirTemp("", "mds_copy_*")
+	if err != nil {
+		return "", "", err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	writePreview := func(idx int, text string) error {
+		return os.WriteFile(filepath.Join(tmpDir, fmt.Sprintf("%d.txt", idx)), []byte(text), 0644)
+	}
+
+	if err := writePreview(0, content); err != nil {
+		return "", "", err
+	}
+
 	options := []string{wholeLabel}
 	for i, b := range blocks {
+		if err := writePreview(i+1, b.Body); err != nil {
+			return "", "", err
+		}
 		lang := b.Lang
 		if lang == "" {
 			lang = "无语言"
@@ -708,7 +726,16 @@ func selectCopyContent(content string) (string, string, error) {
 		options = append(options, fmt.Sprintf("代码块 %d (%s, %d 行)", i+1, lang, lineCount))
 	}
 
-	cmd := exec.Command("fzf", "--prompt", "复制内容 > ", "--height", "40%")
+	previewScript := createCopyPreviewScript(tmpDir)
+	defer os.Remove(previewScript)
+
+	cmd := exec.Command("fzf",
+		"--prompt", "复制内容 > ",
+		"--preview-window", "right:60%:wrap",
+		"--preview", previewScript+" {}",
+		"--bind", "enter:accept",
+		"--bind", "ctrl-c:abort",
+	)
 	cmd.Stdin = strings.NewReader(strings.Join(options, "\n"))
 	cmd.Stderr = os.Stderr
 
@@ -734,6 +761,31 @@ func selectCopyContent(content string) (string, string, error) {
 	}
 
 	return content, wholeLabel, nil
+}
+
+// createCopyPreviewScript 生成用于预览"复制内容"候选项的脚本
+func createCopyPreviewScript(dir string) string {
+	script := fmt.Sprintf(`#!/bin/bash
+line="$1"
+case "$line" in
+  整体内容)
+    cat "%s/0.txt"
+    ;;
+  代码块*)
+    n=$(echo "$line" | sed 's/^代码块 \([0-9]*\).*/\1/')
+    cat "%s/$n.txt"
+    ;;
+esac
+`, dir, dir)
+
+	tmpFile, err := os.CreateTemp("", "copy_preview_*.sh")
+	if err != nil {
+		return ""
+	}
+	tmpFile.WriteString(script)
+	tmpFile.Close()
+	os.Chmod(tmpFile.Name(), 0755)
+	return tmpFile.Name()
 }
 
 func copyToClipboard(text string) error {
