@@ -72,6 +72,9 @@ func main() {
 		case "--list-aliases":
 			handleListAliases()
 			return
+		case "--install-completion":
+			handleInstallCompletion()
+			return
 		}
 	}
 
@@ -312,6 +315,8 @@ func printHelp() {
 	fmt.Println("  --help / -h                        显示此帮助信息")
 	fmt.Println()
 	fmt.Println("  --completion <bash|zsh>            输出对应 shell 的补全脚本")
+	fmt.Println("  --install-completion [bash|zsh]    自动安装补全到用户环境")
+	fmt.Println("                                    省略 shell 时按 $SHELL 推断")
 	fmt.Println("  --list-aliases                     仅列出所有别名（供补全脚本调用）")
 	fmt.Println()
 	fmt.Println("示例 (长参数):")
@@ -405,7 +410,122 @@ func handleCompletion() {
 	}
 }
 
+// completionInstallDir 返回补全脚本的安装目录
+func completionInstallDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".local", "share", "mds"), nil
+}
+
+// detectShell 根据 $SHELL 推断当前 shell，默认 zsh
+func detectShell() string {
+	sh := filepath.Base(os.Getenv("SHELL"))
+	if strings.Contains(sh, "bash") {
+		return "bash"
+	}
+	return "zsh"
+}
+
+const (
+	completionBlockStart = "# >>> mds completion >>>"
+	completionBlockEnd   = "# <<< mds completion <<<"
+)
+
+// upsertManagedBlock 在 rc 文件中写入（或替换）由标记包裹的补全配置块
+func upsertManagedBlock(rcPath, block string) error {
+	content := ""
+	if data, err := os.ReadFile(rcPath); err == nil {
+		content = string(data)
+	}
+
+	managed := completionBlockStart + "\n" + block + completionBlockEnd + "\n"
+
+	start := strings.Index(content, completionBlockStart)
+	if start >= 0 {
+		end := strings.Index(content[start:], completionBlockEnd)
+		if end >= 0 {
+			end += start + len(completionBlockEnd)
+			end += len("\n")
+			content = content[:start] + managed + content[end:]
+			return os.WriteFile(rcPath, []byte(content), 0644)
+		}
+	}
+
+	if content != "" && !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	content += "\n" + managed
+	return os.WriteFile(rcPath, []byte(content), 0644)
+}
+
+// handleInstallCompletion 把补全脚本安装到用户目录，并写入 shell 启动文件
+// 用法: mds --install-completion [bash|zsh]
+func handleInstallCompletion() {
+	shell := ""
+	if len(os.Args) > 2 {
+		shell = os.Args[2]
+	}
+	if shell == "" {
+		shell = detectShell()
+	}
+	if shell != "bash" && shell != "zsh" {
+		fmt.Fprintf(os.Stderr, "不支持的 shell: %s（仅支持 bash / zsh）\n", shell)
+		os.Exit(1)
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "错误：无法获取用户目录: %v\n", err)
+		os.Exit(1)
+	}
+
+	installDir, err := completionInstallDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "错误：%v\n", err)
+		os.Exit(1)
+	}
+	if err := os.MkdirAll(installDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "错误：创建目录 %s 失败: %v\n", installDir, err)
+		os.Exit(1)
+	}
+
+	var target, rcPath, block string
+	switch shell {
+	case "bash":
+		target = filepath.Join(installDir, "completion.bash")
+		rcPath = filepath.Join(home, ".bashrc")
+		block = fmt.Sprintf("[ -f %q ] && source %q\n", target, target)
+	case "zsh":
+		target = filepath.Join(installDir, "_mds")
+		rcPath = filepath.Join(home, ".zshrc")
+		block = fmt.Sprintf("fpath=(%q $fpath)\nif (( $+functions[compdef] )); then\n  compdef _mds mds mdsearch\nfi\n", installDir)
+	}
+
+	script := bashCompletionScript
+	if shell == "zsh" {
+		script = zshCompletionScript
+	}
+	if err := os.WriteFile(target, []byte(script), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "错误：写入补全脚本 %s 失败: %v\n", target, err)
+		os.Exit(1)
+	}
+
+	if err := upsertManagedBlock(rcPath, block); err != nil {
+		fmt.Fprintf(os.Stderr, "错误：更新 %s 失败: %v\n", rcPath, err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("已安装 %s 补全:\n", shell)
+	fmt.Printf("  补全脚本: %s\n", target)
+	fmt.Printf("  启动配置: %s\n", rcPath)
+	fmt.Println()
+	fmt.Printf("执行 'source %s' 或重开终端即可生效。\n", rcPath)
+}
+
 const bashCompletionScript = `# bash completion for mds
+# 安装: mds --install-completion bash
 _mds() {
     local cur prev
     cur="${COMP_WORDS[COMP_CWORD]}"

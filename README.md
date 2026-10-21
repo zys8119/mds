@@ -122,26 +122,30 @@ mds --help                         # 查看完整帮助
 
 内置 bash / zsh 补全脚本，支持补全子命令、`--config` 的子操作、shell 名，以及**已配置的资源别名**。
 
-### bash
+### 一键安装（推荐）
 
 ```bash
-# 临时生效
-source <(mds --completion bash)
-
-# 永久生效
-mds --completion bash > /usr/local/etc/bash_completion.d/mds
-# 或
-echo 'source <(mds --completion bash)' >> ~/.bashrc
+mds --install-completion        # 按 $SHELL 自动识别 bash / zsh
+mds --install-completion zsh    # 也可显式指定
 ```
 
-### zsh
+安装内容：
+
+| shell | 补全脚本                             | 启动配置                                  |
+|-------|--------------------------------------|-------------------------------------------|
+| bash  | `~/.local/share/mds/completion.bash` | 在 `~/.bashrc` 中追加 source 语句         |
+| zsh   | `~/.local/share/mds/_mds`            | 在 `~/.zshrc` 中追加 `fpath` 与 `compdef` |
+
+写入 rc 文件的内容由 `# >>> mds completion >>>` / `# <<< mds completion <<<` 包裹，重复执行只会替换这一段，不会重复追加。装完执行 `source ~/.zshrc`（或 `~/.bashrc`）或重开终端即可生效。
+
+### 手动安装
 
 ```bash
-# 写入 fpath 中的目录，文件名需以 _ 开头
-mds --completion zsh > "${fpath[1]}/_mds"
+# bash：临时生效
+source <(mds --completion bash)
 
-# 或在 ~/.zshrc 中直接 source
-echo 'source <(mds --completion zsh)' >> ~/.zshrc
+# zsh：写入 fpath 中的目录，文件名需以 _ 开头
+mds --completion zsh > "${fpath[1]}/_mds"
 ```
 
 补全效果：
